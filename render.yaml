@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: perchance-image-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: API_SECRET
+        generateValue: true        # Render auto-generates a random secret
+      - key: ALLOWED_ORIGINS
+        value: "*"                 # Change to your Firebase domain in production
+                                   # e.g. https://imagenaibot.web.app
+      - key: MAX_IMAGES
+        value: "4"
+    healthCheckPath: /health
