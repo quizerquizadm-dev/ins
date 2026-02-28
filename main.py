@@ -1,14 +1,3 @@
-"""
-Perchance Image Generation API
---------------------------------
-FastAPI server that wraps the eeemoon/perchance library.
-Deploy on Render.com free tier.
-
-Endpoints:
-  GET  /health         → health check
-  POST /generate       → generate image(s), returns list of base64 URLs
-"""
-
 import asyncio
 import base64
 import logging
@@ -30,64 +19,40 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config from environment ────────────────────────────────────────────────────
-# Set these in Render dashboard → Environment tab
-API_SECRET = os.getenv("API_SECRET", "change-me-in-production")
+API_SECRET      = os.getenv("API_SECRET", "change-me-in-production")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-MAX_IMAGES = int(os.getenv("MAX_IMAGES", "4"))  # cap per request
-
-# ── Perchance generator singleton ─────────────────────────────────────────────
-# We keep ONE ImageGenerator alive for the whole process lifetime.
-# The library handles its own key refresh internally.
-_generator = None
-_generator_lock = asyncio.Lock()
+MAX_IMAGES      = int(os.getenv("MAX_IMAGES", "4"))
 
 
-async def get_generator():
-    """Return the shared ImageGenerator, creating it on first call."""
-    global _generator
-    if _generator is None:
-        async with _generator_lock:
-            if _generator is None:
-                log.info("Initialising Perchance ImageGenerator…")
-                try:
-                    import perchance
-                    _generator = perchance.ImageGenerator()
-                    log.info("ImageGenerator ready ✓")
-                except Exception as exc:
-                    log.error("Failed to create ImageGenerator: %s", exc)
-                    raise
-    return _generator
-
-
-# ── Lifespan: warm up the generator at startup ────────────────────────────────
+# ── Lifespan: validate perchance is importable at startup ─────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log.info("Starting up — validating perchance install…")
     try:
-        await get_generator()
+        import perchance  # noqa: F401
+        log.info("perchance import OK ✓")
     except Exception as exc:
-        log.warning("Warm-up failed (will retry on first request): %s", exc)
+        log.error("perchance import FAILED: %s", exc)
     yield
-    # Cleanup on shutdown
-    global _generator
-    if _generator is not None:
-        try:
-            await _generator.__aexit__(None, None, None)
-        except Exception:
-            pass
+    log.info("Shutting down.")
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Perchance Image API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
+# ── CORS — must be registered BEFORE any routes ───────────────────────────────
+# allow_credentials MUST be False when allow_origins contains "*"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],        # includes OPTIONS preflight
     allow_headers=["*"],
+    max_age=3600,               # browsers cache preflight for 1 hour
 )
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
@@ -100,18 +65,11 @@ async def verify_key(key: Optional[str] = Security(api_key_header)):
     return key
 
 
+# ── Valid shapes ───────────────────────────────────────────────────────────────
+VALID_SHAPES = {"square", "portrait", "landscape", "tall", "wide"}
+
+
 # ── Request / Response models ──────────────────────────────────────────────────
-
-# Perchance supported shapes (maps to resolution internally in the library)
-VALID_SHAPES = {
-    "square":    "square",      # 512×512
-    "portrait":  "portrait",    # 512×768
-    "landscape": "landscape",   # 768×512
-    "tall":      "tall",        # 384×680  (9:16)
-    "wide":      "wide",        # 680×384  (16:9)
-}
-
-
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=2000)
     negative_prompt: Optional[str] = Field(
@@ -125,7 +83,7 @@ class GenerateRequest(BaseModel):
 
 class ImageResult(BaseModel):
     index: int
-    data_url: str        # "data:image/png;base64,…"  ready to use in <img src>
+    data_url: str        # "data:image/png;base64,…" ready to use in <img src>
     seed: Optional[int]
     shape: str
 
@@ -140,7 +98,8 @@ class GenerateResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "generator_ready": _generator is not None}
+    """Health check — no auth required. Used for wake-up pings."""
+    return {"status": "ok"}
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -148,30 +107,37 @@ async def generate(
     req: GenerateRequest,
     _key: str = Security(verify_key),
 ):
-    t0 = time.perf_counter()
+    # Import here — already cached by Python after first import at startup
+    import perchance
 
-    shape = VALID_SHAPES.get(req.shape, "portrait")
+    t0    = time.perf_counter()
+    shape = req.shape if req.shape in VALID_SHAPES else "portrait"
     num   = min(req.num_images or 1, MAX_IMAGES)
 
     log.info("generate | prompt=%r  shape=%s  n=%d", req.prompt[:60], shape, num)
 
-    gen = await get_generator()
-
     results: list[ImageResult] = []
 
-    # Generate images sequentially — Perchance free tier is rate-limited
-    for i in range(num):
-        attempt = 0
-        while attempt < 3:
-            try:
-                async with await gen.image(
-                    req.prompt,
-                    negative_prompt=req.negative_prompt,
-                    shape=shape,
-                    seed=req.seed,
-                ) as result:
-                    binary = await result.download()
-                    b64 = base64.b64encode(binary.read()).decode()
+    # ── Correct usage per eeemoon/perchance README ─────────────────────────
+    # ImageGenerator must be used as an async context manager.
+    # gen.image() returns a result directly (not a context manager itself).
+    # ──────────────────────────────────────────────────────────────────────
+    async with perchance.ImageGenerator() as gen:
+        for i in range(num):
+            attempt = 0
+            while attempt < 3:
+                try:
+                    log.info("  generating image %d/%d (attempt %d)…", i + 1, num, attempt + 1)
+
+                    result = await gen.image(
+                        req.prompt,
+                        negative_prompt=req.negative_prompt,
+                        shape=shape,
+                        seed=req.seed,
+                    )
+
+                    binary   = await result.download()
+                    b64      = base64.b64encode(binary.read()).decode()
                     data_url = f"data:image/png;base64,{b64}"
 
                     results.append(ImageResult(
@@ -180,30 +146,29 @@ async def generate(
                         seed=getattr(result, "seed", req.seed),
                         shape=shape,
                     ))
-                    log.info("  image %d/%d done", i + 1, num)
+                    log.info("  image %d/%d done ✓", i + 1, num)
                     break  # success — exit retry loop
 
-            except Exception as exc:
-                attempt += 1
-                log.warning("  image %d attempt %d failed: %s", i + 1, attempt, exc)
-                if attempt >= 3:
-                    # Don't crash entire request — include a failure placeholder
-                    log.error("  giving up on image %d", i + 1)
-                    # Re-raise only if ALL images failed
-                    if i == 0 and num == 1:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"Perchance generation failed after 3 attempts: {exc}",
-                        )
-                else:
+                except Exception as exc:
+                    attempt += 1
+                    log.warning("  image %d attempt %d failed: %s", i + 1, attempt, exc)
+                    if attempt >= 3:
+                        log.error("  giving up on image %d after 3 attempts", i + 1)
+                        # Only hard-fail if this was the only image requested
+                        if i == 0 and num == 1:
+                            raise HTTPException(
+                                status_code=502,
+                                detail=f"Perchance generation failed after 3 attempts: {exc}",
+                            )
+                        break  # skip this image, continue with others
                     await asyncio.sleep(5 * attempt)  # back-off: 5s, 10s
 
-        # Brief pause between images to respect rate limits
-        if i < num - 1:
-            await asyncio.sleep(3)
+            # Brief pause between images to respect Perchance rate limits
+            if i < num - 1:
+                await asyncio.sleep(3)
 
     elapsed = round(time.perf_counter() - t0, 2)
-    log.info("request complete in %.1fs", elapsed)
+    log.info("request complete in %.1fs — %d image(s) returned", elapsed, len(results))
 
     return GenerateResponse(
         images=results,
