@@ -1,16 +1,13 @@
 FROM python:3.11-slim
 
-# System deps for Playwright Firefox
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgtk-3-0 \
-    libdbus-glib-1-2 \
-    libxt6 \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libcups2 \
     libdrm2 \
+    libdbus-1-3 \
     libxkbcommon0 \
     libxcomposite1 \
     libxdamage1 \
@@ -21,9 +18,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libcairo2 \
     libcairo-gobject2 \
+    libgtk-3-0 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxext6 \
     fonts-liberation \
     libssl3 \
-    wget \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -31,11 +33,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Wipe any cached browser state and install ONLY Firefox
+# Chromium — confirmed from generator.py: self._pw.chromium.launch(headless=True)
 RUN rm -rf /root/.cache/ms-playwright \
-    && playwright install firefox --with-deps \
-    && echo "Firefox installed at:" \
-    && find /root/.cache/ms-playwright -name "firefox" -type f 2>/dev/null | head -5
+    && playwright install chromium --with-deps \
+    && echo "=== Installed ===" \
+    && ls /root/.cache/ms-playwright/
 
 COPY main.py .
 
