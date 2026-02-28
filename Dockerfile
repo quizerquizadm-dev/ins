@@ -1,7 +1,6 @@
-# ── Stage 1: base image with all system deps for Playwright ───────────────────
 FROM python:3.11-slim
 
-# Playwright needs these system libs for Chromium
+# System deps for Playwright full Chromium + Xvfb virtual display
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Chromium core
     libnss3 \
@@ -22,7 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     # Font rendering
     fonts-liberation \
-    # Clean up
+    # Virtual display — makes Chromium think it has a real screen
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -31,15 +31,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright's bundled Chromium
-# (this is what perchance library uses under the hood)
+# Install full Chromium (NOT headless-shell) so fingerprinting passes
 RUN playwright install chromium --with-deps
 
 # Copy app source
 COPY main.py .
 
-# Expose port (Render uses $PORT env var)
+# Expose port
 EXPOSE 10000
 
-# Start server
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Start Xvfb virtual display on :99, then launch the server
+# DISPLAY=:99 makes Playwright use the virtual display → Chromium is non-headless
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX +render -noreset & sleep 1 && DISPLAY=:99 uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
