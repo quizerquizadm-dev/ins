@@ -3,13 +3,13 @@ services:
     name: perchance-image-api
     runtime: docker
     dockerfilePath: ./Dockerfile
+    # Render free tier has 512MB RAM. Chromium needs ~300MB so we stay just
+    # within limits by reusing the browser across requests (see main.py).
+    # If you hit OOM errors, upgrade to the "starter" plan (512MB → 2GB).
     plan: free
     envVars:
       - key: API_SECRET
         generateValue: true        # Render auto-generates a random secret
-      - key: ALLOWED_ORIGINS
-        value: "*"                 # Change to your Firebase domain in production
-                                   # e.g. https://imagenaibot.web.app
       - key: MAX_IMAGES
         value: "4"
     healthCheckPath: /health
