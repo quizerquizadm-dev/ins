@@ -110,14 +110,36 @@ async def _get_user_key() -> str:
         ctx = await _get_context()
 
         async with await ctx.new_page() as page:
+            # Step 1: navigate to the actual Perchance generator page so our
+            # fetch() calls come from https://perchance.org (not a null origin).
+            # A null/blob origin is a common bot-detection trigger.
             await page.goto(
+                "https://perchance.org/ai-text-to-image-generator",
+                wait_until="domcontentloaded",
+                timeout=45_000,
+            )
+
+            # Step 2: call verifyUser via fetch() inside the page, exactly as
+            # the real Perchance UI does — this gets raw JSON, not an
+            # HTML-wrapped version, and looks like a legitimate XHR.
+            verify_url = (
                 f"{BASE_URL}/verifyUser"
                 f"?thread=0"
-                f"&__cacheBust={random.random()}",
-                wait_until="domcontentloaded",
-                timeout=30_000,
+                f"&__cacheBust={random.random()}"
             )
-            content = await page.content()
+            response_text = await page.evaluate("""
+                async (url) => {
+                    try {
+                        const resp = await fetch(url);
+                        return await resp.text();
+                    } catch(e) {
+                        return 'FETCH_ERROR: ' + e.message;
+                    }
+                }
+            """, verify_url)
+
+        log.info("verifyUser response (first 300): %r", response_text[:300])
+        content = response_text
 
         # Parse exactly as the perchance library does
         marker = '"userKey":"'
@@ -125,7 +147,7 @@ async def _get_user_key() -> str:
         if start == -1:
             if "too_many_requests" in content:
                 raise HTTPException(502, "Perchance rate limit hit — try again later")
-            raise HTTPException(502, "Failed to retrieve userKey from Perchance")
+            raise HTTPException(502, f"Failed to retrieve userKey. Response: {content[:300]}")
 
         start += len(marker)
         end    = content.find('"', start)
