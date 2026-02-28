@@ -1,3 +1,15 @@
+"""
+Perchance Image Generation API
+--------------------------------
+FastAPI server that wraps the eeemoon/perchance library.
+Uses Xvfb virtual display so Chromium runs non-headless,
+bypassing Perchance's bot/fingerprint detection.
+
+Endpoints:
+  GET  /health         → health check (shows DISPLAY value)
+  POST /generate       → generate image(s), returns list of base64 URLs
+"""
+
 import asyncio
 import base64
 import logging
@@ -23,11 +35,18 @@ API_SECRET      = os.getenv("API_SECRET", "change-me-in-production")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 MAX_IMAGES      = int(os.getenv("MAX_IMAGES", "4"))
 
+# ── Ensure DISPLAY is set for Xvfb so Chromium runs non-headless ──────────────
+# Set by Dockerfile CMD before uvicorn starts. We defensively set it
+# here too in case of manual/local runs.
+if not os.environ.get("DISPLAY"):
+    os.environ["DISPLAY"] = ":99"
+    log.warning("DISPLAY was not set — defaulting to :99")
 
-# ── Lifespan: validate perchance is importable at startup ─────────────────────
+
+# ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting up — validating perchance install…")
+    log.info("Starting up — DISPLAY=%s", os.environ.get("DISPLAY", "NOT SET"))
     try:
         import perchance  # noqa: F401
         log.info("perchance import OK ✓")
@@ -44,15 +63,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── CORS — must be registered BEFORE any routes ───────────────────────────────
-# allow_credentials MUST be False when allow_origins contains "*"
+# ── CORS ───────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],        # includes OPTIONS preflight
+    allow_credentials=False,  # must be False when allow_origins=["*"]
+    allow_methods=["*"],      # includes OPTIONS preflight
     allow_headers=["*"],
-    max_age=3600,               # browsers cache preflight for 1 hour
+    max_age=3600,
 )
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
@@ -98,8 +116,8 @@ class GenerateResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    """Health check — no auth required. Used for wake-up pings."""
-    return {"status": "ok"}
+    """Health check — no auth required. Shows DISPLAY so you can verify Xvfb."""
+    return {"status": "ok", "display": os.environ.get("DISPLAY", "NOT SET")}
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -107,27 +125,29 @@ async def generate(
     req: GenerateRequest,
     _key: str = Security(verify_key),
 ):
-    # Import here — already cached by Python after first import at startup
     import perchance
 
     t0    = time.perf_counter()
     shape = req.shape if req.shape in VALID_SHAPES else "portrait"
     num   = min(req.num_images or 1, MAX_IMAGES)
 
-    log.info("generate | prompt=%r  shape=%s  n=%d", req.prompt[:60], shape, num)
+    log.info("generate | prompt=%r  shape=%s  n=%d  display=%s",
+             req.prompt[:60], shape, num, os.environ.get("DISPLAY"))
 
     results: list[ImageResult] = []
 
     # ── Correct usage per eeemoon/perchance README ─────────────────────────
     # ImageGenerator must be used as an async context manager.
-    # gen.image() returns a result directly (not a context manager itself).
+    # DISPLAY=:99 makes Playwright launch full Chromium via Xvfb virtual
+    # display, which passes Perchance's browser fingerprinting check.
     # ──────────────────────────────────────────────────────────────────────
     async with perchance.ImageGenerator() as gen:
         for i in range(num):
             attempt = 0
             while attempt < 3:
                 try:
-                    log.info("  generating image %d/%d (attempt %d)…", i + 1, num, attempt + 1)
+                    log.info("  generating image %d/%d (attempt %d)…",
+                             i + 1, num, attempt + 1)
 
                     result = await gen.image(
                         req.prompt,
@@ -147,28 +167,28 @@ async def generate(
                         shape=shape,
                     ))
                     log.info("  image %d/%d done ✓", i + 1, num)
-                    break  # success — exit retry loop
+                    break
 
                 except Exception as exc:
                     attempt += 1
-                    log.warning("  image %d attempt %d failed: %s", i + 1, attempt, exc)
+                    log.warning("  image %d attempt %d failed: %s",
+                                i + 1, attempt, exc)
                     if attempt >= 3:
                         log.error("  giving up on image %d after 3 attempts", i + 1)
-                        # Only hard-fail if this was the only image requested
                         if i == 0 and num == 1:
                             raise HTTPException(
                                 status_code=502,
                                 detail=f"Perchance generation failed after 3 attempts: {exc}",
                             )
-                        break  # skip this image, continue with others
-                    await asyncio.sleep(5 * attempt)  # back-off: 5s, 10s
+                        break
+                    await asyncio.sleep(5 * attempt)
 
-            # Brief pause between images to respect Perchance rate limits
             if i < num - 1:
                 await asyncio.sleep(3)
 
     elapsed = round(time.perf_counter() - t0, 2)
-    log.info("request complete in %.1fs — %d image(s) returned", elapsed, len(results))
+    log.info("request complete in %.1fs — %d image(s) returned",
+             elapsed, len(results))
 
     return GenerateResponse(
         images=results,
