@@ -1,12 +1,10 @@
 """
 Perchance Image Generation API
 --------------------------------
-FastAPI server that wraps the eeemoon/perchance library.
-Uses Xvfb virtual display so Chromium runs non-headless,
-bypassing Perchance's bot/fingerprint detection.
+FastAPI server using Pollinations.ai — free, no auth, no Playwright needed.
 
 Endpoints:
-  GET  /health         → health check (shows DISPLAY value)
+  GET  /health         → health check
   POST /generate       → generate image(s), returns list of base64 URLs
 """
 
@@ -17,7 +15,9 @@ import os
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
+from urllib.parse import quote
 
+import httpx
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
@@ -30,28 +30,19 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Config from environment ────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 API_SECRET      = os.getenv("API_SECRET", "change-me-in-production")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 MAX_IMAGES      = int(os.getenv("MAX_IMAGES", "4"))
 
-# ── Ensure DISPLAY is set for Xvfb so Chromium runs non-headless ──────────────
-# Set by Dockerfile CMD before uvicorn starts. We defensively set it
-# here too in case of manual/local runs.
-if not os.environ.get("DISPLAY"):
-    os.environ["DISPLAY"] = ":99"
-    log.warning("DISPLAY was not set — defaulting to :99")
+# Pollinations base URL
+POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting up — DISPLAY=%s", os.environ.get("DISPLAY", "NOT SET"))
-    try:
-        import perchance  # noqa: F401
-        log.info("perchance import OK ✓")
-    except Exception as exc:
-        log.error("perchance import FAILED: %s", exc)
+    log.info("Starting up — Pollinations.ai backend, no Playwright needed ✓")
     yield
     log.info("Shutting down.")
 
@@ -59,7 +50,7 @@ async def lifespan(app: FastAPI):
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Perchance Image API",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -67,8 +58,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # must be False when allow_origins=["*"]
-    allow_methods=["*"],      # includes OPTIONS preflight
+    allow_credentials=False,
+    allow_methods=["*"],
     allow_headers=["*"],
     max_age=3600,
 )
@@ -83,8 +74,14 @@ async def verify_key(key: Optional[str] = Security(api_key_header)):
     return key
 
 
-# ── Valid shapes ───────────────────────────────────────────────────────────────
-VALID_SHAPES = {"square", "portrait", "landscape", "tall", "wide"}
+# ── Shape → width/height map ───────────────────────────────────────────────────
+SHAPE_DIMENSIONS = {
+    "square":    (512, 512),
+    "portrait":  (512, 768),
+    "landscape": (768, 512),
+    "tall":      (384, 680),
+    "wide":      (680, 384),
+}
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -101,7 +98,7 @@ class GenerateRequest(BaseModel):
 
 class ImageResult(BaseModel):
     index: int
-    data_url: str        # "data:image/png;base64,…" ready to use in <img src>
+    data_url: str        # "data:image/jpeg;base64,…" ready for <img src>
     seed: Optional[int]
     shape: str
 
@@ -116,8 +113,7 @@ class GenerateResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    """Health check — no auth required. Shows DISPLAY so you can verify Xvfb."""
-    return {"status": "ok", "display": os.environ.get("DISPLAY", "NOT SET")}
+    return {"status": "ok", "backend": "pollinations.ai"}
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -125,66 +121,74 @@ async def generate(
     req: GenerateRequest,
     _key: str = Security(verify_key),
 ):
-    import perchance
-
     t0    = time.perf_counter()
-    shape = req.shape if req.shape in VALID_SHAPES else "portrait"
+    shape = req.shape if req.shape in SHAPE_DIMENSIONS else "portrait"
     num   = min(req.num_images or 1, MAX_IMAGES)
+    w, h  = SHAPE_DIMENSIONS[shape]
 
-    log.info("generate | prompt=%r  shape=%s  n=%d  display=%s",
-             req.prompt[:60], shape, num, os.environ.get("DISPLAY"))
+    # Combine prompt + negative prompt hint for Pollinations
+    full_prompt = req.prompt
+    if req.negative_prompt:
+        full_prompt += f" | avoid: {req.negative_prompt}"
+
+    log.info("generate | prompt=%r  shape=%s  size=%dx%d  n=%d",
+             req.prompt[:60], shape, w, h, num)
 
     results: list[ImageResult] = []
 
-    # ── Correct usage per eeemoon/perchance README ─────────────────────────
-    # ImageGenerator must be used as an async context manager.
-    # DISPLAY=:99 makes Playwright launch full Chromium via Xvfb virtual
-    # display, which passes Perchance's browser fingerprinting check.
-    # ──────────────────────────────────────────────────────────────────────
-    async with perchance.ImageGenerator() as gen:
+    async with httpx.AsyncClient(timeout=90.0) as client:
         for i in range(num):
+            # Each image gets a unique seed (or increments from user seed)
+            seed = (req.seed + i) if req.seed is not None else (int(time.time()) + i)
+
+            encoded_prompt = quote(full_prompt)
+            url = (
+                f"{POLLINATIONS_URL}/{encoded_prompt}"
+                f"?width={w}&height={h}&seed={seed}&nologo=true&enhance=false"
+            )
+
             attempt = 0
             while attempt < 3:
                 try:
-                    log.info("  generating image %d/%d (attempt %d)…",
-                             i + 1, num, attempt + 1)
+                    log.info("  fetching image %d/%d (attempt %d) seed=%d…",
+                             i + 1, num, attempt + 1, seed)
 
-                    result = await gen.image(
-                        req.prompt,
-                        negative_prompt=req.negative_prompt,
-                        shape=shape,
-                        seed=req.seed,
-                    )
+                    response = await client.get(url)
 
-                    binary   = await result.download()
-                    b64      = base64.b64encode(binary.read()).decode()
-                    data_url = f"data:image/png;base64,{b64}"
-
-                    results.append(ImageResult(
-                        index=i,
-                        data_url=data_url,
-                        seed=getattr(result, "seed", req.seed),
-                        shape=shape,
-                    ))
-                    log.info("  image %d/%d done ✓", i + 1, num)
-                    break
+                    if response.status_code == 200:
+                        b64      = base64.b64encode(response.content).decode()
+                        data_url = f"data:image/jpeg;base64,{b64}"
+                        results.append(ImageResult(
+                            index=i,
+                            data_url=data_url,
+                            seed=seed,
+                            shape=shape,
+                        ))
+                        log.info("  image %d/%d done ✓  (%d bytes)",
+                                 i + 1, num, len(response.content))
+                        break
+                    else:
+                        raise Exception(
+                            f"Pollinations returned HTTP {response.status_code}"
+                        )
 
                 except Exception as exc:
                     attempt += 1
                     log.warning("  image %d attempt %d failed: %s",
                                 i + 1, attempt, exc)
                     if attempt >= 3:
-                        log.error("  giving up on image %d after 3 attempts", i + 1)
+                        log.error("  giving up on image %d", i + 1)
                         if i == 0 and num == 1:
                             raise HTTPException(
                                 status_code=502,
-                                detail=f"Perchance generation failed after 3 attempts: {exc}",
+                                detail=f"Image generation failed: {exc}",
                             )
                         break
-                    await asyncio.sleep(5 * attempt)
+                    await asyncio.sleep(3 * attempt)
 
+            # Small pause between images
             if i < num - 1:
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
 
     elapsed = round(time.perf_counter() - t0, 2)
     log.info("request complete in %.1fs — %d image(s) returned",
