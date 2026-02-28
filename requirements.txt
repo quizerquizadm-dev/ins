@@ -1,7 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pydantic==2.10.3
-git+https://github.com/eeemoon/perchance.git
-aiofiles==25.1.0
 aiohttp>=3.9.0
-playwright==1.57.0
+aiofiles==25.1.0
+playwright==1.49.0
