@@ -1,18 +1,16 @@
 """
-Perchance Image Generation API — Render deployment version
+Perchance Image Generation API - Render deployment (v8)
 
-Approach (from imagegen.py source):
-  1. Launch headless Chromium once and reuse it (saves ~300MB RAM per request)
-  2. Navigate to /verifyUser, parse userKey from page content directly
-  3. POST to /generate, poll until imageId arrives
-  4. Download via /downloadTemporaryImage
+Key insight: the "Failed to fetch" error was a CSP/CORS block inside the browser
+page context. Fix: use Playwright's APIRequestContext (ctx.request), which runs
+at the network layer and bypasses all page-level CSP/CORS restrictions.
 
-Key fixes vs the original local version:
-  - Browser is launched ONCE and reused across requests (critical for Render free 512MB)
-  - userKey is cached for 4 minutes (they expire after ~5 min)
-  - Correct Chromium flags for containerised environments (--no-sandbox etc.)
-  - Key extraction matches the actual perchance library source (parse page content)
-  - aiohttp session is reused
+Flow:
+  1. Launch Chromium once; reuse across all requests (saves ~300MB RAM)
+  2. Get userKey via ctx.request.get("/verifyUser") - bypasses CSP completely
+  3. Cache userKey for 4 minutes; refresh lazily
+  4. POST to /generate via aiohttp, poll until imageId arrives
+  5. Download image, return as base64 data URL
 """
 
 import asyncio
@@ -33,18 +31,13 @@ from fastapi.security.api_key import APIKeyHeader
 from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
 from pydantic import BaseModel, Field
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-API_SECRET   = os.getenv("API_SECRET", "change-me-in-production")
-MAX_IMAGES   = int(os.getenv("MAX_IMAGES", "4"))
-BASE_URL     = "https://image-generation.perchance.org/api"
-KEY_TTL      = 240  # seconds before we refresh the userKey (they expire ~5 min)
+API_SECRET = os.getenv("API_SECRET", "change-me-in-production")
+MAX_IMAGES = int(os.getenv("MAX_IMAGES", "4"))
+BASE_URL   = "https://image-generation.perchance.org/api"
+KEY_TTL    = 240
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":  "*",
@@ -52,33 +45,29 @@ CORS_HEADERS = {
     "Access-Control-Allow-Methods": "*",
 }
 
-# ── Global browser state (reused across requests) ─────────────────────────────
 _pw:       Optional[Playwright]     = None
 _browser:  Optional[Browser]        = None
 _context:  Optional[BrowserContext] = None
 _user_key: Optional[str]            = None
 _key_ts:   float                    = 0.0
 _http:     Optional[aiohttp.ClientSession] = None
-_lock      = asyncio.Lock()  # serialise key-refresh attempts
+_lock      = asyncio.Lock()
 
 
 async def _get_context() -> BrowserContext:
-    """Return (and lazily create) the shared browser context."""
     global _pw, _browser, _context
-
     if _context is not None:
         return _context
-
-    log.info("Launching Chromium (first request)…")
+    log.info("Launching Chromium...")
     _pw = await async_playwright().start()
     _browser = await _pw.chromium.launch(
         headless=True,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",   # avoids /dev/shm OOM in containers
+            "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--single-process",          # lower memory on small instances
+            "--single-process",
         ],
     )
     _context = await _browser.new_context(
@@ -86,18 +75,23 @@ async def _get_context() -> BrowserContext:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
-        )
+        ),
+        extra_http_headers={
+            "Referer": "https://perchance.org/",
+            "Origin":  "https://perchance.org",
+        },
     )
-    log.info("Chromium ready ✓")
+    log.info("Chromium ready")
     return _context
 
 
 async def _get_user_key() -> str:
     """
-    Return a cached userKey, refreshing it when it's stale.
+    Fetch (or return cached) userKey.
 
-    Matches the extraction logic in the perchance library source:
-        navigate to /verifyUser, read page content, parse '"userKey":"<value>"'
+    Uses ctx.request (Playwright's APIRequestContext) which runs at the network
+    layer - NOT inside a page's JS sandbox. This completely bypasses the CSP on
+    perchance.org that blocks cross-origin fetch() calls from within a page.
     """
     global _user_key, _key_ts
 
@@ -106,66 +100,42 @@ async def _get_user_key() -> str:
         if _user_key and age < KEY_TTL:
             return _user_key
 
-        log.info("Refreshing userKey (age=%.0fs)…", age)
+        log.info("Refreshing userKey (age=%.0fs)...", age)
         ctx = await _get_context()
 
-        async with await ctx.new_page() as page:
-            # Step 1: navigate to the actual Perchance generator page so our
-            # fetch() calls come from https://perchance.org (not a null origin).
-            # A null/blob origin is a common bot-detection trigger.
-            await page.goto(
-                "https://perchance.org/ai-text-to-image-generator",
-                wait_until="domcontentloaded",
-                timeout=45_000,
-            )
+        verify_url = (
+            f"{BASE_URL}/verifyUser"
+            f"?thread=0"
+            f"&__cacheBust={random.random()}"
+        )
 
-            # Step 2: call verifyUser via fetch() inside the page, exactly as
-            # the real Perchance UI does — this gets raw JSON, not an
-            # HTML-wrapped version, and looks like a legitimate XHR.
-            verify_url = (
-                f"{BASE_URL}/verifyUser"
-                f"?thread=0"
-                f"&__cacheBust={random.random()}"
-            )
-            response_text = await page.evaluate("""
-                async (url) => {
-                    try {
-                        const resp = await fetch(url);
-                        return await resp.text();
-                    } catch(e) {
-                        return 'FETCH_ERROR: ' + e.message;
-                    }
-                }
-            """, verify_url)
+        resp = await ctx.request.get(verify_url, timeout=30_000)
+        content = await resp.text()
+        log.info("verifyUser status=%d body(300)=%r", resp.status, content[:300])
 
-        log.info("verifyUser response (first 300): %r", response_text[:300])
-        content = response_text
-
-        # Parse exactly as the perchance library does
         marker = '"userKey":"'
         start  = content.find(marker)
         if start == -1:
             if "too_many_requests" in content:
-                raise HTTPException(502, "Perchance rate limit hit — try again later")
-            raise HTTPException(502, f"Failed to retrieve userKey. Response: {content[:300]}")
+                raise HTTPException(502, "Perchance rate limit - try again later")
+            raise HTTPException(502, f"userKey not found. Response: {content[:300]}")
 
         start += len(marker)
         end    = content.find('"', start)
         if end == -1:
-            raise HTTPException(502, "Malformed userKey response from Perchance")
+            raise HTTPException(502, "Malformed userKey response")
 
         key = content[start:end]
         if not key:
-            raise HTTPException(502, "Empty userKey returned by Perchance")
+            raise HTTPException(502, "Empty userKey")
 
         _user_key = key
         _key_ts   = time.monotonic()
-        log.info("userKey refreshed ✓ (%.12s…)", key)
+        log.info("userKey refreshed: %.12s...", key)
         return key
 
 
 async def _get_http() -> aiohttp.ClientSession:
-    """Return (and lazily create) the shared aiohttp session."""
     global _http
     if _http is None or _http.closed:
         _http = aiohttp.ClientSession()
@@ -178,12 +148,7 @@ async def _generate_image(
     shape: str,
     seed: int,
 ) -> tuple[io.BytesIO, int, int, int]:
-    """
-    Generate one image.  Returns (image_bytes, seed, width, height).
 
-    Uses the same POST body that imagegen.py uses, but via aiohttp
-    (faster than opening a new browser page for the POST).
-    """
     resolution = {
         "portrait":  "512x768",
         "landscape": "768x512",
@@ -209,23 +174,30 @@ async def _generate_image(
         "resolution":     resolution,
         "guidanceScale":  7,
     }
+    req_headers = {
+        "Referer": "https://perchance.org/",
+        "Origin":  "https://perchance.org",
+    }
 
-    # Poll until the job completes (Perchance is async on their side)
     image_id = width = height = out_seed = None
+
     for attempt in range(60):
         try:
-            async with http.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with http.post(
+                url, json=body,
+                headers=req_headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
                 data = await resp.json(content_type=None)
         except Exception as e:
-            log.warning("  generate HTTP error (attempt %d): %s", attempt, e)
+            log.warning("generate HTTP error attempt %d: %s", attempt, e)
             await asyncio.sleep(5)
             continue
 
         status = data.get("status", "")
-        log.info("  generate status=%r attempt=%d", status, attempt)
+        log.info("generate status=%r attempt=%d", status, attempt)
 
         if status == "invalid_key":
-            # Force key refresh and retry once
             global _user_key
             _user_key = None
             key = await _get_user_key()
@@ -235,11 +207,10 @@ async def _generate_image(
                 f"&requestId=aiImageCompletion{random.randint(0, 2**30)}"
                 f"&__cacheBust={random.random()}"
             )
-            continue
         elif status == "too_many_requests":
-            raise HTTPException(429, "Perchance rate limit — try again in a moment")
+            raise HTTPException(429, "Perchance rate limit")
         elif status == "invalid_data":
-            raise HTTPException(400, f"Perchance rejected request data: {data}")
+            raise HTTPException(400, f"Perchance rejected request: {data}")
         elif status == "success":
             image_id = data["imageId"]
             width    = data["width"]
@@ -247,16 +218,18 @@ async def _generate_image(
             out_seed = data.get("seed", seed)
             break
         else:
-            # Still queued / processing
             await asyncio.sleep(4)
     else:
-        raise HTTPException(504, "Timed out waiting for Perchance to generate image")
+        raise HTTPException(504, "Timed out waiting for image generation")
 
-    # Download the finished image
-    download_url = f"{BASE_URL}/downloadTemporaryImage?imageId={image_id}"
-    async with http.get(download_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+    dl_url = f"{BASE_URL}/downloadTemporaryImage?imageId={image_id}"
+    async with http.get(
+        dl_url,
+        headers=req_headers,
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as resp:
         if resp.status != 200:
-            raise HTTPException(502, f"Failed to download image: HTTP {resp.status}")
+            raise HTTPException(502, f"Image download failed: HTTP {resp.status}")
         raw = await resp.read()
 
     buf = io.BytesIO(raw)
@@ -264,34 +237,27 @@ async def _generate_image(
     return buf, out_seed, width, height
 
 
-# ── App lifecycle ─────────────────────────────────────────────────────────────
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-warm: launch browser and fetch first key at startup
-    # so the first real request isn't slow
     try:
         await _get_user_key()
-        log.info("Pre-warm complete ✓")
+        log.info("Pre-warm complete")
     except Exception as e:
         log.warning("Pre-warm failed (will retry on first request): %s", e)
     yield
-    # Shutdown: clean up browser
     global _pw, _browser, _context, _http
-    if _context:
-        await _context.close()
-    if _browser:
-        await _browser.close()
-    if _pw:
-        await _pw.stop()
+    for obj, method in [(_context, "close"), (_browser, "close"), (_pw, "stop")]:
+        if obj:
+            try:
+                await getattr(obj, method)()
+            except Exception:
+                pass
     if _http and not _http.closed:
         await _http.close()
-    log.info("Shutdown complete.")
+    log.info("Shutdown complete")
 
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="Perchance Image API", version="7.0.0", lifespan=lifespan)
+app = FastAPI(title="Perchance Image API", version="8.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -315,11 +281,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     log.error("Unhandled exception: %s", exc, exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": str(exc)},
-        headers=CORS_HEADERS,
-    )
+    return JSONResponse(status_code=500, content={"detail": str(exc)}, headers=CORS_HEADERS)
 
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -327,7 +289,7 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def verify_key(key: Optional[str] = Security(api_key_header)):
     if API_SECRET != "change-me-in-production" and key != API_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        raise HTTPException(401, "Invalid or missing API key")
     return key
 
 
@@ -380,43 +342,39 @@ async def generate(
     num   = min(req.num_images or 1, MAX_IMAGES)
     seed  = req.seed if req.seed is not None else random.randint(0, 99_999_999)
 
-    log.info("generate | prompt=%r  shape=%s  n=%d  seed=%d",
-             req.prompt[:60], shape, num, seed)
-
+    log.info("generate prompt=%r shape=%s n=%d seed=%d", req.prompt[:60], shape, num, seed)
     results: list[ImageResult] = []
 
     for i in range(num):
         for attempt in range(3):
             try:
-                log.info("  image %d/%d attempt %d…", i + 1, num, attempt + 1)
+                log.info("  image %d/%d attempt %d", i + 1, num, attempt + 1)
                 buf, out_seed, width, height = await _generate_image(
                     prompt          = req.prompt,
                     negative_prompt = req.negative_prompt or "",
                     shape           = shape,
                     seed            = seed + i,
                 )
-                b64      = base64.b64encode(buf.read()).decode()
-                data_url = f"data:image/png;base64,{b64}"
+                b64 = base64.b64encode(buf.read()).decode()
                 results.append(ImageResult(
-                    index=i, data_url=data_url, seed=out_seed,
-                    shape=shape, width=width, height=height,
+                    index=i, data_url=f"data:image/png;base64,{b64}",
+                    seed=out_seed, shape=shape, width=width, height=height,
                 ))
-                log.info("  image %d/%d done ✓ (%dx%d)", i + 1, num, width, height)
+                log.info("  image %d/%d done (%dx%d)", i + 1, num, width, height)
                 break
             except HTTPException:
-                raise   # don't retry on explicit HTTP errors
+                raise
             except Exception as exc:
                 log.warning("  image %d attempt %d failed: %s", i + 1, attempt + 1, exc)
                 if attempt == 2:
                     if i == 0 and num == 1:
                         raise HTTPException(502, f"Generation failed: {exc}")
-                    break   # skip this image, return what we have
+                    break
                 await asyncio.sleep(4 * (attempt + 1))
 
         if i < num - 1:
             await asyncio.sleep(2)
 
     elapsed = round(time.perf_counter() - t0, 2)
-    log.info("complete in %.1fs — %d image(s)", elapsed, len(results))
-
+    log.info("complete %.1fs %d image(s)", elapsed, len(results))
     return GenerateResponse(images=results, prompt=req.prompt, elapsed_seconds=elapsed)
