@@ -1,21 +1,26 @@
 """
-Perchance Image Generation API - Render deployment (v8)
+Perchance Image Generation API - Render deployment (v9)
 
-Key insight: the "Failed to fetch" error was a CSP/CORS block inside the browser
-page context. Fix: use Playwright's APIRequestContext (ctx.request), which runs
-at the network layer and bypasses all page-level CSP/CORS restrictions.
+The challenge: Perchance uses Cloudflare which serves a JS challenge to
+datacenter IPs. ctx.request (plain HTTP) gets blocked with 403.
+
+The fix: navigate a real browser page to the verifyUser endpoint and intercept
+the response BEFORE Cloudflare can redirect - using page.route() to capture
+the raw JSON response body at the network layer while the full JS engine
+handles the Cloudflare challenge automatically.
 
 Flow:
-  1. Launch Chromium once; reuse across all requests (saves ~300MB RAM)
-  2. Get userKey via ctx.request.get("/verifyUser") - bypasses CSP completely
-  3. Cache userKey for 4 minutes; refresh lazily
-  4. POST to /generate via aiohttp, poll until imageId arrives
-  5. Download image, return as base64 data URL
+  1. Launch Chromium once; reuse across requests
+  2. Open a page, navigate to perchance.org first (establishes CF cookies/tokens)
+  3. Use page.route() to intercept the verifyUser response and grab the body
+  4. Cache userKey 4 min, refresh lazily
+  5. POST /generate via aiohttp with CF cookies from the browser context
 """
 
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 import random
@@ -28,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
-from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
+from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright, Route, Request as PWRequest
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -37,7 +42,7 @@ log = logging.getLogger(__name__)
 API_SECRET = os.getenv("API_SECRET", "change-me-in-production")
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "4"))
 BASE_URL   = "https://image-generation.perchance.org/api"
-KEY_TTL    = 240
+KEY_TTL    = 240  # seconds
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":  "*",
@@ -76,10 +81,6 @@ async def _get_context() -> BrowserContext:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
-        extra_http_headers={
-            "Referer": "https://perchance.org/",
-            "Origin":  "https://perchance.org",
-        },
     )
     log.info("Chromium ready")
     return _context
@@ -87,11 +88,14 @@ async def _get_context() -> BrowserContext:
 
 async def _get_user_key() -> str:
     """
-    Fetch (or return cached) userKey.
+    Get userKey by:
+    1. Loading perchance.org in a real browser page (solves CF challenge, gets cookies)
+    2. Using page.route() to intercept the verifyUser network response
+    3. Extracting userKey from the intercepted JSON body
 
-    Uses ctx.request (Playwright's APIRequestContext) which runs at the network
-    layer - NOT inside a page's JS sandbox. This completely bypasses the CSP on
-    perchance.org that blocks cross-origin fetch() calls from within a page.
+    This works because Playwright's full browser engine executes Cloudflare's
+    JS challenge, earns the cf_clearance cookie, and subsequent requests from
+    that browser context pass through normally.
     """
     global _user_key, _key_ts
 
@@ -103,31 +107,79 @@ async def _get_user_key() -> str:
         log.info("Refreshing userKey (age=%.0fs)...", age)
         ctx = await _get_context()
 
-        verify_url = (
-            f"{BASE_URL}/verifyUser"
-            f"?thread=0"
-            f"&__cacheBust={random.random()}"
-        )
+        intercepted_body: dict = {}
+        verify_done = asyncio.Event()
 
-        resp = await ctx.request.get(verify_url, timeout=30_000)
-        content = await resp.text()
-        log.info("verifyUser status=%d body(300)=%r", resp.status, content[:300])
+        async def handle_route(route: Route, request: PWRequest):
+            # Let the request proceed, then capture the response body
+            response = await route.fetch()
+            body = await response.text()
+            log.info("intercepted verifyUser status=%d body(200)=%r",
+                     response.status, body[:200])
+            intercepted_body["text"] = body
+            intercepted_body["status"] = response.status
+            verify_done.set()
+            # Fulfill with the real response so the page doesn't break
+            await route.fulfill(response=response, body=body)
+
+        async with await ctx.new_page() as page:
+            # Intercept the verifyUser call at network level
+            await page.route("**/verifyUser**", handle_route)
+
+            # Navigate to the actual generator page - this:
+            # a) Triggers Cloudflare JS challenge (browser solves it automatically)
+            # b) Earns cf_clearance cookie for future requests
+            # c) The page itself calls verifyUser, which we intercept
+            log.info("Navigating to perchance generator page...")
+            try:
+                await page.goto(
+                    "https://perchance.org/ai-text-to-image-generator",
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
+            except Exception as e:
+                log.warning("page.goto raised (may be ok if route fired): %s", e)
+
+            # Wait for the intercepted verifyUser response (up to 30s)
+            try:
+                await asyncio.wait_for(verify_done.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Page loaded but didn't call verifyUser automatically
+                # Trigger it manually via page.evaluate
+                log.info("verifyUser not auto-called, triggering manually...")
+                result = await page.evaluate("""
+                    async () => {
+                        try {
+                            const r = await fetch(
+                                'https://image-generation.perchance.org/api/verifyUser'
+                                + '?thread=0&__cacheBust=' + Math.random()
+                            );
+                            return await r.text();
+                        } catch(e) { return 'ERR:' + e.message; }
+                    }
+                """)
+                intercepted_body["text"] = result
+                intercepted_body["status"] = 200
+                log.info("manual verifyUser result(200): %r", result[:200])
+
+        content = intercepted_body.get("text", "")
+        status  = intercepted_body.get("status", 0)
 
         marker = '"userKey":"'
         start  = content.find(marker)
         if start == -1:
             if "too_many_requests" in content:
                 raise HTTPException(502, "Perchance rate limit - try again later")
-            raise HTTPException(502, f"userKey not found. Response: {content[:300]}")
+            raise HTTPException(
+                502,
+                f"userKey not found (status={status}). Body: {content[:300]}"
+            )
 
         start += len(marker)
         end    = content.find('"', start)
-        if end == -1:
-            raise HTTPException(502, "Malformed userKey response")
-
-        key = content[start:end]
+        key    = content[start:end] if end != -1 else ""
         if not key:
-            raise HTTPException(502, "Empty userKey")
+            raise HTTPException(502, f"Empty/malformed userKey. Body: {content[:200]}")
 
         _user_key = key
         _key_ts   = time.monotonic()
@@ -138,7 +190,18 @@ async def _get_user_key() -> str:
 async def _get_http() -> aiohttp.ClientSession:
     global _http
     if _http is None or _http.closed:
-        _http = aiohttp.ClientSession()
+        # Pull CF cookies from the browser context to use in aiohttp requests
+        cookies = {}
+        if _context:
+            try:
+                cf_cookies = await _context.cookies(
+                    ["https://perchance.org", "https://image-generation.perchance.org"]
+                )
+                cookies = {c["name"]: c["value"] for c in cf_cookies}
+                log.info("Loaded %d cookies from browser context", len(cookies))
+            except Exception as e:
+                log.warning("Could not load cookies: %s", e)
+        _http = aiohttp.ClientSession(cookies=cookies)
     return _http
 
 
@@ -175,7 +238,7 @@ async def _generate_image(
         "guidanceScale":  7,
     }
     req_headers = {
-        "Referer": "https://perchance.org/",
+        "Referer": "https://perchance.org/ai-text-to-image-generator",
         "Origin":  "https://perchance.org",
     }
 
@@ -184,8 +247,7 @@ async def _generate_image(
     for attempt in range(60):
         try:
             async with http.post(
-                url, json=body,
-                headers=req_headers,
+                url, json=body, headers=req_headers,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 data = await resp.json(content_type=None)
@@ -198,9 +260,11 @@ async def _generate_image(
         log.info("generate status=%r attempt=%d", status, attempt)
 
         if status == "invalid_key":
-            global _user_key
+            global _user_key, _http
             _user_key = None
+            _http = None  # also reset http so cookies are refreshed
             key = await _get_user_key()
+            http = await _get_http()
             url = (
                 f"{BASE_URL}/generate"
                 f"?userKey={key}"
@@ -224,8 +288,7 @@ async def _generate_image(
 
     dl_url = f"{BASE_URL}/downloadTemporaryImage?imageId={image_id}"
     async with http.get(
-        dl_url,
-        headers=req_headers,
+        dl_url, headers=req_headers,
         timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         if resp.status != 200:
@@ -257,7 +320,7 @@ async def lifespan(app: FastAPI):
     log.info("Shutdown complete")
 
 
-app = FastAPI(title="Perchance Image API", version="8.0.0", lifespan=lifespan)
+app = FastAPI(title="Perchance Image API", version="9.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -280,7 +343,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log.error("Unhandled exception: %s", exc, exc_info=True)
+    log.error("Unhandled: %s", exc, exc_info=True)
     return JSONResponse(status_code=500, content={"detail": str(exc)}, headers=CORS_HEADERS)
 
 
@@ -329,7 +392,7 @@ class GenerateResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "browser_ready": _browser is not None}
+    return {"status": "ok", "browser_ready": _browser is not None, "has_key": bool(_user_key)}
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -350,10 +413,8 @@ async def generate(
             try:
                 log.info("  image %d/%d attempt %d", i + 1, num, attempt + 1)
                 buf, out_seed, width, height = await _generate_image(
-                    prompt          = req.prompt,
-                    negative_prompt = req.negative_prompt or "",
-                    shape           = shape,
-                    seed            = seed + i,
+                    prompt=req.prompt, negative_prompt=req.negative_prompt or "",
+                    shape=shape, seed=seed + i,
                 )
                 b64 = base64.b64encode(buf.read()).decode()
                 results.append(ImageResult(
